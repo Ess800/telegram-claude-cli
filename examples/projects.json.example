@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "projects": {
+    "default": {
+      "display_name": "Home",
+      "path": "~"
+    },
+    "example": {
+      "display_name": "Example project",
+      "path": "~/src/example"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+config.env
+projects.json
+state/
+*.log
+.env

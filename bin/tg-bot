@@ -1,0 +1,1264 @@
+#!/usr/bin/env python3
+"""tg-bot v4 - Telegram chat front-end for the live Claude Code session.
+
+Model:
+- No terminal control. The bot never types into a pane.
+- The target conversation is the live interactive Claude session on this VM,
+  discovered from ~/.claude/sessions/<pid>.json (entrypoint "cli", socket live).
+- A Telegram message is delivered into that session over its local messaging
+  socket, so it appears in the session the user is reading on their laptop.
+- The bot tails that session's transcript and posts Claude's reply back.
+- Replying in Telegram to a bot message continues the conversation that
+  message came from (message_id -> session mapping).
+- Sessions/Projects navigation is preserved; choosing a non-live session falls
+  back to a headless `claude -p --resume <id>` continuation.
+"""
+import copy
+import html
+import json
+import mimetypes
+import os
+import queue
+import re
+import socket
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG = HOME / ".config/tg-bot/config.env"
+STATE = HOME / ".local/state/tg-bot"
+PROJECTS_FILE = Path(os.environ.get("TG_PROJECTS_FILE", HOME / ".config/tg-bot/projects.json"))
+LAST = STATE / "last"
+PENDING = STATE / "pending"
+INBOX = STATE / "inbox"
+FILES = STATE / "files"
+SETTINGS = STATE / "settings.json"
+MSGMAP = STATE / "msgmap.json"
+REGISTRY = HOME / ".claude/sessions"
+CLAUDE = str(HOME / ".local/bin/claude")
+for d in (STATE, LAST, PENDING, PENDING / "files", INBOX, FILES):
+    d.mkdir(parents=True, exist_ok=True)
+
+
+def load_config():
+    cfg = {}
+    for line in CONFIG.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        cfg[k.strip()] = v.strip().strip('"').strip("'")
+    return cfg
+
+
+CFG = load_config()
+TOKEN = CFG["TG_BOT_TOKEN"]
+CHAT = str(CFG["TG_CHAT_ID"])
+API = f"https://api.telegram.org/bot{TOKEN}"
+
+SETTINGS_LOCK = threading.Lock()
+CHAT_Q = queue.Queue()
+LIVE_Q = queue.Queue()
+CURRENT_PROC = None
+
+DEFAULTS = {
+    "mode": "idle",              # idle | chat
+    "project": None,
+    "session": None,
+    "target_override": None,     # explicit session picked from /sessions
+    "project_sessions": {},      # project -> last session id seen
+    "pending_new": False,
+    "pending_text": None,
+    "last_view": "home",
+    "last_list": [],
+    "panel_msg": None,
+}
+
+KEYBOARD = {
+    "keyboard": [
+        [{"text": "🎛 Menu"}, {"text": "💬 Live chat"}],
+        [{"text": "🗂 Sessions"}, {"text": "📁 Projects"}],
+        [{"text": "🆕 New"}, {"text": "🔄 Refresh"}],
+        [{"text": "📋 Last"}, {"text": "📥 Incoming"}],
+        [{"text": "✖️ Minimize"}],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
+
+COMPACT_KEYBOARD = {
+    "keyboard": [[{"text": "✳️ Claude"}]],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
+
+HELP = (
+    "👋 <b>Claude Control</b>\n\n"
+    "Just type to talk to the live session on your laptop — replies stream back here.\n\n"
+    "Icons: 🎛 Menu · 💬 Live chat · 🗂 Sessions · 📁 Projects · "
+    "🆕 New · 🔄 Refresh · 📋 Last · 📥 Incoming\n\n"
+    "Status lives in the 🎛 Menu panel. "
+    "Tap ✖️ Minimize to collapse the icons to ✳️ Claude."
+)
+
+
+# ---------------- settings ----------------
+def load_settings():
+    d = copy.deepcopy(DEFAULTS)
+    try:
+        d.update(json.loads(SETTINGS.read_text()))
+    except Exception:
+        pass
+    if not isinstance(d.get("project_sessions"), dict):
+        d["project_sessions"] = {}
+    d["mode"] = "chat" if d.get("project") else "idle"
+    return d
+
+
+def save_settings(s):
+    with SETTINGS_LOCK:
+        SETTINGS.write_text(json.dumps(s, ensure_ascii=False))
+
+
+def load_msgmap():
+    try:
+        d = json.loads(MSGMAP.read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def remember_out(resp, project, sid):
+    if not resp or not resp.get("ok"):
+        return
+    try:
+        mid = str(resp["result"]["message_id"])
+    except Exception:
+        return
+    with SETTINGS_LOCK:
+        m = load_msgmap()
+        m[mid] = {"project": project, "session": sid, "ts": int(time.time())}
+        if len(m) > 500:
+            for k in sorted(m, key=lambda k: m[k].get("ts", 0))[: len(m) - 500]:
+                m.pop(k, None)
+        MSGMAP.write_text(json.dumps(m))
+
+
+def mapped_target(msg):
+    rt = msg.get("reply_to_message") or {}
+    mid = rt.get("message_id")
+    if not mid:
+        return None
+    return load_msgmap().get(str(mid))
+
+
+# ---------------- telegram ----------------
+def api(method, payload=None, timeout=40):
+    data = json.dumps(payload or {}).encode()
+    req = urllib.request.Request(
+        f"{API}/{method}", data=data, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": e.read().decode(errors="replace"), "status": e.code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def api_multipart(method, fields, files, timeout=120):
+    boundary = "----tg" + uuid.uuid4().hex
+    out = bytearray()
+    for k, v in fields.items():
+        out += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
+    for k, (filename, data, ctype) in files.items():
+        out += (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; "
+            f"filename=\"{filename}\"\r\nContent-Type: {ctype}\r\n\r\n"
+        ).encode()
+        out += data + b"\r\n"
+    out += f"--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        f"{API}/{method}",
+        data=bytes(out),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": e.read().decode(errors="replace"), "status": e.code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def send_text(chat_id, text, reply_markup=None, parse_mode=None, reply_to=None):
+    payload = {"chat_id": chat_id, "text": (text or "")[:4000]}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if reply_to:
+        payload["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+    r = api("sendMessage", payload)
+    if not r.get("ok"):
+        print("send_text failed:", str(r)[:300], flush=True)
+    return r
+
+
+def send_document(chat_id, path, caption="", reply_to=None):
+    p = Path(path)
+    if not p.is_file():
+        return {"ok": False, "error": f"missing file {p}"}
+    ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+    fields = {"chat_id": chat_id, "caption": caption[:1000]}
+    if reply_to:
+        fields["reply_parameters"] = json.dumps({"message_id": reply_to, "allow_sending_without_reply": True})
+    return api_multipart("sendDocument", fields,
+                         {"document": (p.name, p.read_bytes(), ctype)})
+
+
+# ---------------- live session registry ----------------
+def registry_entries():
+    out = []
+    if not REGISTRY.exists():
+        return out
+    for f in REGISTRY.glob("*.json"):
+        try:
+            e = json.loads(f.read_text())
+        except Exception:
+            continue
+        if e.get("kind") != "interactive":
+            continue
+        if e.get("entrypoint") != "cli":
+            continue
+        sp = e.get("messagingSocketPath") or ""
+        if not sp or not Path(sp).exists():
+            continue
+        e["_pid"] = e.get("pid") or int(f.stem)
+        out.append(e)
+    return out
+
+
+def find_session(sid=None, pid=None):
+    for e in registry_entries():
+        if sid and e.get("sessionId") == sid:
+            return e
+        if pid and e.get("_pid") == pid:
+            return e
+    return None
+
+
+def live_session():
+    entries = registry_entries()
+    if not entries:
+        return None
+    for e in entries:
+        if str(e.get("tmux") or "").startswith("main:"):
+            return e
+    entries.sort(key=lambda e: e.get("updatedAt") or 0, reverse=True)
+    return entries[0]
+
+
+def keyfile_for(e):
+    pid = e.get("_pid") or e.get("pid")
+    fs = sorted(REGISTRY.glob(f"{pid}.*.key"))
+    return fs[0] if fs else None
+
+
+def peer_token(e):
+    kf = keyfile_for(e)
+    if not kf:
+        return None
+    try:
+        return json.loads(kf.read_text()).get("peerToken")
+    except Exception:
+        return None
+
+
+def project_map():
+    out = {}
+    p = PROJECTS_FILE
+    if p.exists():
+        try:
+            for k, v in json.loads(p.read_text()).get("projects", {}).items():
+                out[k] = str(Path(v.get("path") or (HOME / "projects" / k)).expanduser())
+        except Exception:
+            pass
+    out.setdefault("default", str(HOME))
+    return out
+
+
+def encoded(path):
+    return str(path).replace("/", "-")
+
+
+def transcript_path(e):
+    cwd = e.get("cwd") or str(HOME)
+    return HOME / ".claude/projects" / encoded(cwd) / f"{e.get('sessionId')}.jsonl"
+
+
+def project_matches_live(project, e):
+    try:
+        return Path(project_map().get(project, str(HOME))).resolve() == Path(e.get("cwd") or "/").resolve()
+    except Exception:
+        return False
+
+
+def inject_user(e, text):
+    """Deliver a user turn into a running interactive session over its socket."""
+    sock = e.get("messagingSocketPath")
+    tok = peer_token(e)
+    if not sock or not Path(sock).exists():
+        raise RuntimeError("live session socket is gone")
+    if not tok:
+        raise RuntimeError("no peer token for live session")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(8)
+    try:
+        s.connect(sock)
+        for frame in (
+            {"type": "auth", "token": tok},
+            {"type": "user", "message": {"role": "user", "content": text}},
+        ):
+            s.sendall((json.dumps(frame) + "\n").encode())
+        time.sleep(0.2)
+    finally:
+        s.close()
+
+
+def read_from(path, offset):
+    """Read complete JSONL entries appended after byte offset."""
+    try:
+        with path.open("rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except Exception:
+        return [], offset
+    if not data:
+        return [], offset
+    if not data.endswith(b"\n"):
+        cut = data.rfind(b"\n")
+        if cut < 0:
+            return [], offset
+        offset += cut + 1
+        data = data[: cut + 1]
+    else:
+        offset += len(data)
+    out = []
+    for raw in data.splitlines():
+        try:
+            out.append(json.loads(raw))
+        except Exception:
+            continue
+    return out, offset
+
+
+def text_of(entry):
+    msg = entry.get("message") or {}
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(x.get("text", "") for x in c
+                        if isinstance(x, dict) and x.get("type") == "text")
+    c = entry.get("content")
+    return c if isinstance(c, str) else ""
+
+
+def last_exchange(path, scan=600):
+    """Last user text and last assistant text in a transcript."""
+    user = assistant = None
+    try:
+        lines = path.read_text(errors="ignore").splitlines()[-scan:]
+    except Exception:
+        return None, None
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        t = d.get("type")
+        txt = text_of(d).strip()
+        if t == "user" and txt and not txt.startswith("[Request interrupted"):
+            user = txt
+        elif t == "assistant" and txt:
+            assistant = txt
+    return user, assistant
+
+
+def relay_live(chat_id, ph, reply_to, e, sent_text, offset):
+    """Wait for the live session to answer the injected turn and relay it."""
+    path = transcript_path(e)
+    deadline = time.time() + 300
+    seen = False
+    pieces = []
+    ended = False
+    held = False
+    idle_cycles = 0
+    last_edit = 0.0
+    last_typing = 0.0
+    last_shown = None
+    started = time.time()
+    spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    while time.time() < deadline and not ended:
+        time.sleep(1.5)
+        entries, offset = read_from(path, offset)
+        if entries:
+            idle_cycles = 0
+        else:
+            idle_cycles += 1
+        for d in entries:
+            t = d.get("type")
+            if t == "system" and "Held peer message" in str(d.get("content") or ""):
+                if sent_text[:40] in str(d.get("content") or ""):
+                    held = True
+                    ended = True
+                    break
+            elif t == "queue-operation":
+                if sent_text[:60] in str(d.get("content") or ""):
+                    seen = True
+            elif t == "attachment":
+                att = d.get("attachment") or {}
+                if (att.get("type") == "queued_command"
+                        and sent_text[:60] in str(att.get("prompt") or "")):
+                    seen = True
+            elif t == "user":
+                # The first new user entry after the offset is the injected turn.
+                seen = True
+            elif t == "assistant" and seen:
+                txt = text_of(d).strip()
+                if txt:
+                    pieces.append(txt)
+            elif t == "system" and d.get("subtype") == "turn_duration" and seen:
+                ended = True
+                break
+        # Also end when the session is idle and the reply has arrived.
+        if not ended and seen and pieces and idle_cycles >= 2:
+            live_now = live_session()
+            if (live_now or {}).get("status") == "idle":
+                ended = True
+        now = time.time()
+        if ph.get("ok"):
+            body = "\n\n".join(pieces).strip()
+            if body:
+                shown = body[-3500:] + " ▌"
+            else:
+                shown = f"{spinner[int(now * 4) % len(spinner)]} Claude is working on your laptop… {int(now - started)}s"
+            if shown != last_shown and now - last_edit >= 2:
+                api("editMessageText", {
+                    "chat_id": chat_id, "message_id": ph["result"]["message_id"],
+                    "text": shown[:4000],
+                })
+                last_shown = shown
+                last_edit = now
+        if now - last_typing >= 4:
+            api("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+            last_typing = now
+        print(f"relay seen={seen} pieces={len(pieces)} idle={idle_cycles}", flush=True)
+    if held:
+        if ph.get("ok"):
+            api("editMessageText", {
+                "chat_id": chat_id, "message_id": ph["result"]["message_id"],
+                "text": ("⚠️ Your live session held this as a peer message. Approve it in the "
+                         "laptop session, or set crossSessionInbound to \"accept\" there."),
+            })
+    elif not seen:
+        if ph.get("ok"):
+            api("editMessageText", {
+                "chat_id": chat_id, "message_id": ph["result"]["message_id"],
+                "text": "⚠️ Not delivered — the live session is busy or unavailable.",
+            })
+    else:
+        send_result(chat_id, ph, "\n\n".join(pieces).strip() or "(no text returned)", reply_to)
+
+
+# ---------------- panel ----------------
+def _edit_panel(chat_id, s, text, kb, force_new=False):
+    markup = kb if kb else KEYBOARD
+    old = s.get("panel_msg")
+    if old and not force_new:
+        r = api("editMessageText", {
+            "chat_id": chat_id, "message_id": old,
+            "text": text, "parse_mode": "HTML",
+            "reply_markup": markup,
+        })
+        if r.get("ok"):
+            return
+        print("edit_panel failed:", str(r)[:300], flush=True)
+    r = send_text(chat_id, text, markup, "HTML")
+    if r.get("ok"):
+        s["panel_msg"] = r["result"]["message_id"]
+        if old and old != s["panel_msg"]:
+            api("deleteMessage", {"chat_id": chat_id, "message_id": old})
+
+
+def render(chat_id, s, view="home"):
+    live = live_session()
+    if view == "projects":
+        names = list(project_map())
+        s["last_view"] = "projects"
+        s["last_list"] = names
+        lines = ["<b>📁 Projects</b>"]
+        rows, pair = [], []
+        for n in names:
+            pair.append({"text": f"📁 {n}", "callback_data": f"v:p:{n}"})
+            if len(pair) == 2:
+                rows.append(pair); pair = []
+        if pair:
+            rows.append(pair)
+        rows.append([{"text": "⬅️ Back", "callback_data": "v:back"}])
+        text, kb = "\n".join(lines), {"inline_keyboard": rows}
+    elif view == "sessions":
+        project = s.get("project")
+        if not project:
+            return render(chat_id, s, "projects")
+        rows_data = list_sessions(project)
+        override = s.get("target_override")
+        live_id = (live or {}).get("sessionId")
+        s["last_view"] = "sessions"
+        s["last_list"] = [r[1] for r in rows_data]
+        lines = [f"<b>🗂 Sessions · {html.escape(project)}</b>"]
+        if not rows_data:
+            lines.append("No sessions yet.")
+        rows, row = [], []
+        emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+        if rows_data:
+            for i, (ts, sid, lab) in enumerate(rows_data):
+                if sid == live_id:
+                    mark = "🖥"
+                elif sid == override:
+                    mark = "✅"
+                else:
+                    mark = "💬"
+                label = emojis[i] if i < len(emojis) else str(i + 1)
+                row.append({"text": f"{label} {mark} {sid[:6]}",
+                            "callback_data": f"v:s:{project}:{sid}"})
+                if len(row) == 2:
+                    rows.append(row); row = []
+            if row:
+                rows.append(row)
+        rows.append([{"text": "🆕 New", "callback_data": "v:new"},
+                     {"text": "⬅️ Back", "callback_data": "v:back"}])
+        text, kb = "\n".join(lines), {"inline_keyboard": rows}
+    elif view in ("live", "chat", "capture"):
+        s["last_view"] = "live"
+        s["last_list"] = []
+        if not live:
+            text = "<b>Live chat</b>\nNo running interactive Claude session found."
+            kb = None
+        else:
+            user, assistant = last_exchange(transcript_path(live))
+            name = live.get("name") or "session"
+            status = live.get("status") or "?"
+            lines = [
+                "<b>💬 Live conversation</b>",
+                f"{'🟡' if status == 'busy' else '🟢'} <b>{html.escape(name)}</b> · "
+                f"<code>{live['sessionId'][:8]}</code>",
+                f"{html.escape(status)} · {html.escape(str(live.get('tmux') or 'no tmux'))} · "
+                f"⏱ {time.strftime('%H:%M:%S')}",
+            ]
+            if user:
+                lines += ["", "<b>You:</b>", html.escape(user[-1200:])]
+            if assistant:
+                lines += ["", "<b>Claude:</b>", html.escape(assistant[-1800:])]
+            if not user and not assistant:
+                lines.append("\nNo messages yet.")
+            text = "\n".join(lines)
+            kb = None
+    else:
+        s["last_view"] = "home"
+        s["last_list"] = []
+        project = s.get("project")
+        override = s.get("target_override")
+        status = (live or {}).get("status") or "idle"
+        mode = s.get("mode") or "idle"
+        inbox_n = len(list((INBOX / project).glob("*.json"))) if project else 0
+        lines = [
+            "🤖 <b>Claude Control</b>",
+            f"📁 <b>{html.escape(project or 'no project')}</b> · ⚙️ {html.escape(mode)}",
+        ]
+        if live:
+            lines.append(
+                f"{'🟡' if status == 'busy' else '🟢'} "
+                f"<b>{html.escape(live.get('name') or 'session')}</b> · "
+                f"<code>{live['sessionId'][:8]}</code> · {html.escape(status)}")
+            try:
+                last_ts = transcript_path(live).stat().st_mtime
+                lines.append(f"🕒 last {time.strftime('%H:%M', time.localtime(last_ts))} · "
+                             f"🧠 queue {LIVE_Q.qsize()}/{CHAT_Q.qsize()}")
+            except Exception:
+                pass
+        else:
+            lines.append("⚪ live: <b>none</b>")
+        if override:
+            lines.append(f"📌 pinned: <code>{override[:8]}</code>")
+        lines.append(f"📥 incoming {inbox_n} · ⏱ {time.strftime('%H:%M:%S')}")
+        lines.append("Type a message or tap an icon.")
+        text = "\n".join(lines)
+        kb = None
+    _edit_panel(chat_id, s, text, kb, force_new=(view != "live"))
+    save_settings(s)
+
+
+# ---------------- sessions ----------------
+def session_label(path):
+    try:
+        with path.open(errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i > 250:
+                    break
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("type") != "user":
+                    continue
+                t = text_of(d)
+                t = re.sub(r"<[^>]+>", " ", t)
+                t = re.sub(r"\s+", " ", t).strip()
+                t = re.sub(r"^(?:/[a-z-]+\s+)+", "", t, flags=re.I)
+                low = t.lower()
+                if (not t or low == "enabled plan mode" or low.startswith("[request interrupted")
+                        or low.startswith("the command below was run")):
+                    continue
+                return t[:70]
+    except Exception:
+        pass
+    return "(no summary)"
+
+
+def list_sessions(project):
+    path = project_map().get(project)
+    if not path:
+        return []
+    d = HOME / ".claude/projects" / encoded(path)
+    rows = []
+    if d.exists():
+        for f in d.glob("*.jsonl"):
+            try:
+                rows.append((f.stat().st_mtime, f.stem, session_label(f)))
+            except Exception:
+                continue
+    rows.sort(reverse=True)
+    return rows[:8]
+
+
+def choose_project(chat_id, s, name):
+    if name not in project_map():
+        return
+    s["project"] = name
+    s["mode"] = "chat"
+    s["target_override"] = None
+    s["session"] = s.get("project_sessions", {}).get(name)
+    save_settings(s)
+    render(chat_id, s, "home")
+    if s.get("pending_text"):
+        prompt = s["pending_text"]
+        s["pending_text"] = None
+        save_settings(s)
+        deliver(chat_id, name, prompt, None, force_new=False)
+    else:
+        send_text(chat_id, f"Project {name}. Send a message to talk to the live session.")
+
+
+def choose_session(chat_id, s, project, sid):
+    if project not in project_map() or not sid:
+        return
+    s.setdefault("project_sessions", {})[project] = sid
+    s["project"] = project
+    s["session"] = sid
+    s["target_override"] = sid
+    s["mode"] = "chat"
+    s["pending_new"] = False
+    save_settings(s)
+    render(chat_id, s, "home")
+    if find_session(sid=sid):
+        send_text(chat_id, f"Session {sid[:8]} is live. Messages go there.")
+    else:
+        send_text(chat_id, f"Session {sid[:8]} is not running; messages use a headless continuation.")
+
+
+# ---------------- headless fallback ----------------
+def run_claude(project, session_id, prompt):
+    global CURRENT_PROC
+    path = project_map().get(project, str(HOME))
+    cmd = [CLAUDE, "-p", "--output-format", "json"]
+    if session_id:
+        cmd += ["--resume", session_id]
+    cmd += [prompt]
+    env = os.environ.copy()
+    for k in ("CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_ENTRYPOINT",
+              "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+              "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_EXECPATH"):
+        env.pop(k, None)
+    env["HOME"] = str(HOME)
+    proc = subprocess.Popen(cmd, cwd=path, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    CURRENT_PROC = proc
+    try:
+        out, err = proc.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        return {"error": "Timed out after 5 minutes.", "session_id": session_id}
+    finally:
+        CURRENT_PROC = None
+    try:
+        return json.loads(out.strip())
+    except Exception:
+        return {"error": (out or err or "no output").strip(), "session_id": session_id}
+
+
+def run_claude_stream(project, session_id, prompt, chat_id, ph, reply_to=None):
+    """Headless fallback: stream-json, editing one Telegram message live."""
+    global CURRENT_PROC
+    path = project_map().get(project, str(HOME))
+    cmd = [CLAUDE, "-p", "--output-format", "stream-json",
+           "--include-partial-messages", "--verbose"]
+    if session_id:
+        cmd += ["--resume", session_id]
+    cmd += [prompt]
+    env = os.environ.copy()
+    for k in ("CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_ENTRYPOINT",
+              "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+              "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_EXECPATH"):
+        env.pop(k, None)
+    env["HOME"] = str(HOME)
+
+    proc = subprocess.Popen(cmd, cwd=path, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    CURRENT_PROC = proc
+    mid = ph["result"]["message_id"] if ph.get("ok") else None
+    text, status, final = "", "", None
+    last_edit, last_typing = 0.0, 0.0
+    killed = {"v": False}
+
+    def killer():
+        killed["v"] = True
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    timer = threading.Timer(300, killer)
+    timer.start()
+    try:
+        for line in proc.stdout:
+            now = time.time()
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            t = ev.get("type")
+            if t == "stream_event":
+                e = ev.get("event") or {}
+                et = e.get("type")
+                if et == "content_block_start":
+                    cb = e.get("content_block") or {}
+                    if cb.get("type") == "tool_use":
+                        status = f"🔧 {cb.get('name', 'tool')}…"
+                elif et == "content_block_delta":
+                    d = e.get("delta") or {}
+                    if d.get("type") == "text_delta":
+                        text += d.get("text", "")
+                    elif d.get("type") == "thinking_delta" and not text:
+                        status = "🧠 thinking…"
+            elif t == "result":
+                final = ev
+            if mid and now - last_edit >= 1.5:
+                body = (text[-3700:] + " ▌") if text else (status or "▌")
+                r = api("editMessageText", {"chat_id": chat_id, "message_id": mid,
+                                            "text": body[:4000]})
+                last_edit = now if r.get("ok") else now + 3
+            if now - last_typing >= 4:
+                api("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+                last_typing = now
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+    finally:
+        timer.cancel()
+        CURRENT_PROC = None
+
+    data = final or {}
+    if not data.get("result") and text:
+        data["result"] = text
+    if not data.get("session_id") and session_id:
+        data["session_id"] = session_id
+    if killed["v"] and not data.get("result"):
+        data["error"] = "Stopped."
+    elif not data.get("result") and not data.get("error"):
+        data["error"] = "No output."
+    return data
+
+
+def send_result(chat_id, ph, text, reply_to):
+    mid = ph["result"]["message_id"] if ph.get("ok") else None
+    if mid and len(text) <= 3900:
+        r = api("editMessageText", {"chat_id": chat_id, "message_id": mid, "text": text})
+        if r.get("ok"):
+            return
+    if mid:
+        try:
+            api("deleteMessage", {"chat_id": chat_id, "message_id": mid})
+        except Exception:
+            pass
+    for i in range(0, len(text), 3800):
+        send_text(chat_id, text[i:i + 3800], reply_to=reply_to)
+
+
+def chat_worker_loop():
+    while True:
+        chat_id, project, prompt, reply_to, force_new, override = CHAT_Q.get()
+        try:
+            s = load_settings()
+            session = None if force_new else (override or s.get("project_sessions", {}).get(project))
+            ph = send_text(chat_id, "▌", reply_to=reply_to)
+            data = run_claude_stream(project, session, prompt, chat_id, ph, reply_to)
+            sid = data.get("session_id")
+            if sid:
+                s = load_settings()
+                s.setdefault("project_sessions", {})[project] = sid
+                s["session"] = sid
+                s["project"] = project
+                s["mode"] = "chat"
+                s["pending_new"] = False
+                save_settings(s)
+                remember_out(ph, project, sid)
+            if data.get("error") and not data.get("result"):
+                text = "⚠️ " + str(data["error"])[:3500]
+            else:
+                text = data.get("result") or "(no output)"
+            send_result(chat_id, ph, text, reply_to)
+        except Exception as e:
+            send_text(chat_id, f"⚠️ Chat failed: {e}")
+        finally:
+            CHAT_Q.task_done()
+
+
+def live_worker_loop():
+    while True:
+        chat_id, project, prompt, reply_to, sid = LIVE_Q.get()
+        print(f"live deliver project={project} prompt={prompt[:60]!r}", flush=True)
+        try:
+            e = find_session(sid=sid) or live_session()
+            if not e:
+                ph = send_text(chat_id, "⚠️ Live session disappeared; using headless.", reply_to=reply_to)
+                CHAT_Q.put((chat_id, project, prompt, reply_to, False, sid))
+                continue
+            ph = send_text(chat_id, "💬 Delivered to the live session…", reply_to=reply_to)
+            remember_out(ph, project, e["sessionId"])
+            path = transcript_path(e)
+            try:
+                offset = path.stat().st_size
+            except Exception:
+                offset = 0
+            inject_user(e, prompt)
+            relay_live(chat_id, ph, reply_to, e, prompt, offset)
+        except Exception as e:
+            send_text(chat_id, f"⚠️ Live delivery failed: {e}", reply_to=reply_to)
+        finally:
+            LIVE_Q.task_done()
+
+
+def deliver(chat_id, project, prompt, reply_to, force_new, override=None):
+    if not force_new:
+        e = live_session()
+        if e and (override is None or override == e["sessionId"]) and project_matches_live(project, e):
+            if LIVE_Q.qsize() > 0:
+                send_text(chat_id, f"⏳ Queued live (#{LIVE_Q.qsize() + 1})", reply_to=reply_to)
+            LIVE_Q.put((chat_id, project, prompt, reply_to, e["sessionId"]))
+            return
+    if CHAT_Q.qsize() > 0:
+        send_text(chat_id, f"⏳ Queued (#{CHAT_Q.qsize() + 1})", reply_to=reply_to)
+    CHAT_Q.put((chat_id, project, prompt, reply_to, force_new, override))
+
+
+# ---------------- files & last output ----------------
+def ask_session(chat_id, pid):
+    rows = [[{"text": n, "callback_data": f"pick:{pid}:{n}"}] for n in project_map()]
+    rows.append([{"text": "Cancel", "callback_data": f"cancel:{pid}"}])
+    send_text(chat_id, "Which project should this file go to?", {"inline_keyboard": rows})
+
+
+def download_file(file_id, dest):
+    info = api("getFile", {"file_id": file_id})
+    if not info.get("ok"):
+        return None
+    fp = info["result"]["file_path"]
+    with urllib.request.urlopen(f"https://api.telegram.org/file/bot{TOKEN}/{fp}", timeout=90) as r:
+        dest.write_bytes(r.read())
+    return fp
+
+
+def send_last(chat_id, project):
+    # Prefer the live session's most recent reply so the button is never stale.
+    live = live_session()
+    if live and project_matches_live(project, live):
+        user, assistant = last_exchange(transcript_path(live))
+        if assistant:
+            lines = [f"<b>📋 Last reply · {html.escape(project)}</b>"]
+            if user:
+                lines += ["", "<b>You:</b>", html.escape(user[-600:])]
+            lines += ["", "<b>Claude:</b>", html.escape(assistant[-3000:])]
+            send_text(chat_id, "\n".join(lines), None, "HTML")
+            return
+    f = LAST / f"{project}.json"
+    if not f.exists():
+        send_text(chat_id, f"No output recorded for {project}.")
+        return
+    d = json.loads(f.read_text())
+    p = Path(d["path"]) if d.get("path") else None
+    if d.get("type") == "file" and p and p.is_file():
+        send_document(chat_id, p, (d.get("text") or "")[:1000])
+    else:
+        text = d.get("text") or "(empty)"
+        for i in range(0, len(text), 3800):
+            send_text(chat_id, text[i:i + 3800])
+
+
+def show_inbox(chat_id, project):
+    d = INBOX / project
+    items = sorted(d.glob("*.json")) if d.exists() else []
+    if not items:
+        send_text(chat_id, f"Inbox empty for {project}.")
+        return
+    for f in items:
+        try:
+            m = json.loads(f.read_text())
+        except Exception:
+            continue
+        if m.get("path") and Path(m["path"]).is_file():
+            send_document(chat_id, m["path"], m.get("text") or "")
+        elif m.get("text"):
+            send_text(chat_id, m["text"])
+    send_text(chat_id, f"📥 {len(items)} item(s) you sent me for {project}.")
+
+
+# ---------------- routing ----------------
+def handle_command(chat_id, text, s):
+    global CURRENT_PROC
+    cmd, _, arg = text.partition(" ")
+    cmd, arg = cmd.lower(), arg.strip()
+    if cmd in ("/start", "/help"):
+        send_text(chat_id, HELP,
+                  {"inline_keyboard": [[{"text": "🏠 Home", "callback_data": "v:home"}]]}, "HTML")
+    elif cmd == "/menu":
+        render(chat_id, s, "home")
+    elif cmd == "/continue":
+        if not s.get("project"):
+            render(chat_id, s, "projects")
+        else:
+            s["target_override"] = None
+            s["mode"] = "chat"
+            s["pending_new"] = False
+            save_settings(s)
+            render(chat_id, s, "home")
+            send_text(chat_id, "Send a message to continue in the live session.")
+    elif cmd in ("/live", "/chat", "/capture"):
+        render(chat_id, s, "live")
+    elif cmd == "/projects":
+        render(chat_id, s, "projects")
+    elif cmd == "/sessions":
+        if arg:
+            s["project"] = arg
+            save_settings(s)
+        render(chat_id, s, "sessions")
+    elif cmd == "/new":
+        if arg:
+            s["project"] = arg
+        if not s.get("project"):
+            render(chat_id, s, "projects")
+        else:
+            s["pending_new"] = True
+            s["target_override"] = None
+            s["mode"] = "chat"
+            save_settings(s)
+            render(chat_id, s, "home")
+            send_text(chat_id, f"Next message starts a new headless conversation in {s['project']}.")
+    elif cmd == "/ask":
+        if not arg:
+            send_text(chat_id, "Usage: /ask <message>")
+        elif not s.get("project"):
+            send_text(chat_id, "Pick a project first with /projects.")
+        else:
+            deliver(chat_id, s["project"], arg, None, force_new=False,
+                    override=s.get("target_override"))
+    elif cmd == "/status":
+        s2 = load_settings()
+        live = live_session()
+        send_text(chat_id,
+                  f"mode: {s2['mode']}\nproject: {s2.get('project') or '—'}\n"
+                  f"live: {(live or {}).get('name') or '—'} "
+                  f"({(live or {}).get('sessionId', '—')[:8]}) "
+                  f"{(live or {}).get('status') or ''}\n"
+                  f"override: {(s2.get('target_override') or '—')[:8]}\n"
+                  f"live queue: {LIVE_Q.qsize()} · headless queue: {CHAT_Q.qsize()}")
+    elif cmd == "/stop":
+        if CURRENT_PROC and CURRENT_PROC.poll() is None:
+            CURRENT_PROC.terminate()
+            send_text(chat_id, "⏹ Headless run interrupted.")
+        else:
+            send_text(chat_id, "Nothing to stop (the live session is not controlled from here).")
+    elif cmd == "/last":
+        send_last(chat_id, arg or s.get("project") or "default")
+    elif cmd == "/inbox":
+        show_inbox(chat_id, arg or s.get("project") or "default")
+    else:
+        send_text(chat_id, "Unknown command. /help")
+
+
+def handle_text(chat_id, text, reply_to, s, target=None):
+    label_actions = {
+        "🎛 menu": "v:home", "🏠 home": "v:home",
+        "📥 inbox": "v:inbox", "📥 incoming": "v:inbox", "💬 chat": "v:live",
+        "💬 sessions": "v:sessions", "🗂 sessions": "v:sessions",
+        "📋 last": "v:last", "📸 capture": "v:live",
+        "📁 projects": "v:projects", "🟢 live": "v:live",
+        "➕ new chat": "v:new", "🆕 new": "v:new",
+        "ℹ️ status": "v:status", "⌨️ keys": "v:live",
+        "🔄 refresh": "v:refresh", "💬 live chat": "v:live",
+        "✳️ claude": "v:expand", "🤖 claude": "v:expand",
+        "✖️ minimize": "v:collapse",
+        "❓ help": "v:help", "🎛 menu": "v:home",
+    }
+    action = label_actions.get(text.strip().lower())
+    if action:
+        handle_callback({"id": "label", "data": action,
+                         "message": {"chat": {"id": int(chat_id)}, "message_id": 0}})
+        return
+
+    # A Telegram reply inherits the project, but only an explicit Sessions pick
+    # pins a session; otherwise the live session stays the target.
+    project = (target or {}).get("project") or s.get("project")
+    override = s.get("target_override")
+
+    if re.fullmatch(r"\d{1,2}", text) and not target:
+        idx = int(text) - 1
+        if s.get("last_view") == "sessions" and 0 <= idx < len(s.get("last_list") or []):
+            choose_session(chat_id, s, s.get("project"), s["last_list"][idx])
+            return
+        if s.get("last_view") == "projects" and 0 <= idx < len(s.get("last_list") or []):
+            choose_project(chat_id, s, s["last_list"][idx])
+            return
+
+    if s.get("pending_new"):
+        if not project:
+            s["pending_text"] = text
+            save_settings(s)
+            render(chat_id, s, "projects")
+            send_text(chat_id, "Pick a project first; your message will start there.")
+            return
+        s["pending_new"] = False
+        s["target_override"] = None
+        save_settings(s)
+        deliver(chat_id, project, text, reply_to, force_new=True)
+        return
+
+    if project:
+        s["mode"] = "chat"
+        save_settings(s)
+        deliver(chat_id, project, text, reply_to, force_new=False, override=override)
+        return
+
+    s["pending_text"] = text
+    save_settings(s)
+    render(chat_id, s, "projects")
+    send_text(chat_id, "Pick a project; your message will go there.")
+
+
+def handle_message(msg):
+    chat_id = str((msg.get("chat") or {}).get("id", ""))
+    if chat_id != CHAT:
+        return
+    text = (msg.get("text") or "").strip()
+    print(f"message chat={chat_id} text={text[:80]!r}", flush=True)
+    s = load_settings()
+
+    if text.startswith("/"):
+        handle_command(chat_id, text, s)
+        return
+
+    doc = msg.get("document")
+    photo = msg.get("photo")
+    if doc or photo:
+        pid = uuid.uuid4().hex[:10]
+        file_id = doc["file_id"] if doc else photo[-1]["file_id"]
+        name = doc.get("file_name") if doc else f"photo_{pid}.jpg"
+        dest = PENDING / "files" / f"{pid}_{Path(name).name}"
+        item = {"id": pid, "chat_id": chat_id, "date": msg.get("date"),
+                "from": (msg.get("from") or {}).get("username"),
+                "text": (doc or {}).get("caption") or msg.get("caption") or "",
+                "type": "file", "path": "", "filename": name}
+        try:
+            download_file(file_id, dest)
+            item["path"] = str(dest)
+        except Exception as e:
+            print("download failed:", e, flush=True)
+        (PENDING / f"{pid}.json").write_text(json.dumps(item, ensure_ascii=False))
+        ask_session(chat_id, pid)
+        return
+
+    handle_text(chat_id, text, msg.get("message_id"), s, mapped_target(msg))
+
+
+def handle_callback(cq):
+    msg = cq.get("message") or {}
+    chat_id = str((msg.get("chat") or {}).get("id", ""))
+    if chat_id != CHAT:
+        return
+    data = cq.get("data") or ""
+    print(f"callback chat={chat_id} data={data}", flush=True)
+    api("answerCallbackQuery", {"callback_query_id": cq["id"]})
+    s = load_settings()
+    # Edit the message whose button was tapped, so the result is visible
+    # where the user is looking. Text-keyboard labels have no message id.
+    tapped = msg.get("message_id") if msg.get("chat") else None
+    s["panel_msg"] = tapped if tapped else None
+    save_settings(s)
+    # A pending "New conversation" must not survive an unrelated button tap.
+    if data not in ("v:new", "m:new", "v:continue") and s.get("pending_new"):
+        s["pending_new"] = False
+        save_settings(s)
+
+    if data in ("v:home", "m:menu"):
+        render(chat_id, s, "home")
+    elif data == "v:back":
+        if s.get("last_view") == "sessions":
+            render(chat_id, s, "projects")
+        else:
+            render(chat_id, s, "home")
+    elif data == "v:expand":
+        send_text(chat_id, "✳️ Menu expanded", KEYBOARD)
+    elif data == "v:collapse":
+        send_text(chat_id, "✳️ Menu minimized — tap ✳️ Claude to expand", COMPACT_KEYBOARD)
+    elif data in ("v:projects", "m:proj"):
+        render(chat_id, s, "projects")
+    elif data in ("v:sessions", "m:sess"):
+        render(chat_id, s, "sessions")
+    elif data in ("v:live", "m:live", "v:chat", "m:chat"):
+        s["target_override"] = None
+        render(chat_id, s, "live")
+    elif data in ("v:capture", "m:cap", "v:refresh"):
+        render(chat_id, s, "live")
+    elif data == "v:inbox":
+        show_inbox(chat_id, s.get("project") or "default")
+    elif data == "v:last":
+        send_last(chat_id, s.get("project") or "default")
+    elif data == "v:status":
+        handle_command(chat_id, "/status", s)
+    elif data == "v:help":
+        send_text(chat_id, HELP, KEYBOARD, "HTML")
+    elif data in ("v:new", "m:new"):
+        if not s.get("project"):
+            render(chat_id, s, "projects")
+        else:
+            s["pending_new"] = True
+            s["target_override"] = None
+            s["mode"] = "chat"
+            save_settings(s)
+            render(chat_id, s, "home")
+            send_text(chat_id, f"Next message starts a new conversation in {s['project']}.")
+    elif data == "v:continue":
+        if not s.get("project"):
+            render(chat_id, s, "projects")
+        else:
+            s["target_override"] = None
+            s["mode"] = "chat"
+            s["pending_new"] = False
+            save_settings(s)
+            render(chat_id, s, "home")
+            send_text(chat_id, "Send a message to continue in the live session.")
+    elif data.startswith("v:p:"):
+        choose_project(chat_id, s, data.split(":", 2)[2])
+    elif data.startswith("v:s:"):
+        _, _, project, sid = data.split(":", 3)
+        choose_session(chat_id, s, project, sid)
+    elif data.startswith("last:"):
+        send_last(chat_id, data.split(":", 1)[1])
+    elif data.startswith("cancel:"):
+        pid = data.split(":", 1)[1]
+        try:
+            (PENDING / f"{pid}.json").unlink()
+        except FileNotFoundError:
+            pass
+        send_text(chat_id, "Cancelled.")
+    elif data.startswith("pick:"):
+        _, pid, project = data.split(":", 2)
+        try:
+            item = json.loads((PENDING / f"{pid}.json").read_text())
+        except Exception:
+            send_text(chat_id, "That item expired.")
+            return
+        item["project"] = project
+        item["saved_at"] = int(time.time())
+        d = INBOX / project
+        d.mkdir(parents=True, exist_ok=True)
+        if item.get("path"):
+            src = Path(item["path"])
+            dst = FILES / f"{int(time.time())}_{pid}_{src.name}"
+            try:
+                src.rename(dst)
+                item["path"] = str(dst)
+            except Exception:
+                pass
+        (d / f"{int(time.time())}_{pid}.json").write_text(json.dumps(item, ensure_ascii=False))
+        try:
+            (PENDING / f"{pid}.json").unlink()
+        except FileNotFoundError:
+            pass
+        send_text(chat_id, f"Saved to {project}. Read it with /inbox {project}.")
+
+
+def main():
+    api("deleteWebhook", {"drop_pending_updates": False})
+    # Keep only the persistent icon keyboard; no text command menu.
+    api("setMyCommands", {"commands": []})
+    s0 = load_settings()
+    s0["target_override"] = None
+    save_settings(s0)
+    threading.Thread(target=chat_worker_loop, daemon=True).start()
+    threading.Thread(target=live_worker_loop, daemon=True).start()
+    offset = 0
+    f = STATE / "offset"
+    if f.exists():
+        try:
+            offset = int(f.read_text().strip())
+        except Exception:
+            offset = 0
+    live = live_session()
+    print(f"tg-bot v4 starting; live={(live or {}).get('name')} "
+          f"{(live or {}).get('sessionId', '')[:8]}", flush=True)
+    while True:
+        res = api("getUpdates",
+                  {"offset": offset, "timeout": 25, "allowed_updates": ["message", "callback_query"]},
+                  timeout=35)
+        if not res.get("ok"):
+            print("getUpdates error:", res.get("error") or res.get("description"), flush=True)
+            time.sleep(5)
+            continue
+        for u in res.get("result", []):
+            offset = u["update_id"] + 1
+            f.write_text(str(offset))
+            try:
+                if "message" in u:
+                    handle_message(u["message"])
+                elif "callback_query" in u:
+                    handle_callback(u["callback_query"])
+            except Exception as e:
+                print("handler error:", e, flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""tg - send Telegram messages/files and manage per-project outputs.
+
+Usage:
+  tg send --project NAME "text"
+  tg file --project NAME /path/to/file "caption"
+  tg last --project NAME
+  tg inbox --project NAME [--clear]
+  tg projects
+  tg status
+"""
+import argparse
+import os
+import json
+import mimetypes
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG = HOME / ".config/tg-bot/config.env"
+STATE = HOME / ".local/state/tg-bot"
+PROJECTS_FILE = Path(os.environ.get("TG_PROJECTS_FILE", HOME / ".config/tg-bot/projects.json"))
+LAST = STATE / "last"
+INBOX = STATE / "inbox"
+
+
+def load_config():
+    if not CONFIG.exists():
+        sys.exit(f"tg: missing {CONFIG}")
+    cfg = {}
+    for line in CONFIG.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        cfg[k.strip()] = v.strip().strip('"').strip("'")
+    return cfg
+
+
+CFG = load_config()
+TOKEN = CFG.get("TG_BOT_TOKEN", "")
+CHAT = CFG.get("TG_CHAT_ID", "")
+if not TOKEN or not CHAT:
+    sys.exit("tg: config missing TG_BOT_TOKEN or TG_CHAT_ID")
+API = f"https://api.telegram.org/bot{TOKEN}"
+
+
+def _post_json(method, payload, timeout=60):
+    req = urllib.request.Request(
+        f"{API}/{method}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": e.read().decode(errors="replace"), "status": e.code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _post_multipart(method, fields, files, timeout=120):
+    boundary = "----tg" + uuid.uuid4().hex
+    out = bytearray()
+    for k, v in fields.items():
+        out += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
+    for k, (filename, data, ctype) in files.items():
+        out += (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; "
+            f"filename=\"{filename}\"\r\nContent-Type: {ctype}\r\n\r\n"
+        ).encode()
+        out += data + b"\r\n"
+    out += f"--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        f"{API}/{method}",
+        data=bytes(out),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": e.read().decode(errors="replace"), "status": e.code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _keyboard(project):
+    return {"inline_keyboard": [[{"text": "📄 Show last output", "callback_data": f"last:{project}"}]]}
+
+
+def _record_last(project, kind, text="", path=""):
+    LAST.mkdir(parents=True, exist_ok=True)
+    payload = {"type": kind, "text": text, "path": path, "ts": int(time.time())}
+    (LAST / f"{project}.json").write_text(json.dumps(payload, ensure_ascii=False))
+    (LAST / f"{project}.txt").write_text(text or "")
+    return payload
+
+
+def _chunks(text, size=3800):
+    text = text or ""
+    return [text[i:i + size] for i in range(0, len(text), size)] or [""]
+
+
+def cmd_send(args):
+    project = args.project or "default"
+    text = " ".join(args.text)
+    _record_last(project, "text", text=text)
+    last_id = None
+    for part in _chunks(text):
+        r = _post_json("sendMessage", {"chat_id": CHAT, "text": part, "reply_markup": _keyboard(project)})
+        if not r.get("ok"):
+            print("tg: send failed:", r.get("error") or r.get("description"), file=sys.stderr)
+            return 1
+        last_id = r["result"]["message_id"]
+    print(f"sent project={project} message_id={last_id}")
+    return 0
+
+
+def cmd_file(args):
+    project = args.project or "default"
+    p = Path(args.path).expanduser()
+    if not p.is_file():
+        print(f"tg: not a file: {p}", file=sys.stderr)
+        return 1
+    caption = " ".join(args.caption)
+    data = p.read_bytes()
+    ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+    _record_last(project, "file", text=caption, path=str(p))
+    r = _post_multipart(
+        "sendDocument",
+        {"chat_id": CHAT, "caption": caption[:1000], "reply_markup": json.dumps(_keyboard(project))},
+        {"document": (p.name, data, ctype)},
+    )
+    if not r.get("ok"):
+        print("tg: send failed:", r.get("error") or r.get("description"), file=sys.stderr)
+        return 1
+    print(f"sent project={project} file={p} message_id={r['result']['message_id']}")
+    return 0
+
+
+def cmd_last(args):
+    project = args.project or "default"
+    f = LAST / f"{project}.json"
+    if not f.exists():
+        print(f"no output recorded for {project}", file=sys.stderr)
+        return 1
+    d = json.loads(f.read_text())
+    print(d.get("text") or "")
+    if d.get("path"):
+        print(f"\n[file] {d['path']}")
+    return 0
+
+
+def cmd_inbox(args):
+    project = args.project or "default"
+    d = INBOX / project
+    if not d.exists():
+        print(f"inbox empty for {project}")
+        return 0
+    items = sorted(d.glob("*.json"))
+    if args.clear:
+        arch = STATE / "archive" / project
+        arch.mkdir(parents=True, exist_ok=True)
+        for f in items:
+            f.rename(arch / f.name)
+        print(f"archived {len(items)} item(s) from {project}")
+        return 0
+    for f in items:
+        try:
+            m = json.loads(f.read_text())
+        except Exception:
+            continue
+        print(f"--- {f.stem} ---")
+        print(m.get("text") or "")
+        if m.get("path"):
+            print(f"[file] {m['path']}")
+    print(f"\n{len(items)} item(s) in {project}")
+    return 0
+
+
+def cmd_projects(_args):
+    names = []
+    p = PROJECTS_FILE
+    if p.exists():
+        try:
+            names = list(json.loads(p.read_text()).get("projects", {}).keys())
+        except Exception:
+            pass
+    for extra in ("default",):
+        if extra not in names:
+            names.append(extra)
+    for n in names:
+        print(n)
+    return 0
+
+
+def cmd_status(_args):
+    r = _post_json("getMe", {})
+    if r.get("ok"):
+        print("bot:", r["result"].get("username"))
+    else:
+        print("bot: error:", r.get("error") or r.get("description"))
+    print("chat:", CHAT)
+    print("state:", STATE)
+    return 0 if r.get("ok") else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="tg")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("send")
+    s.add_argument("--project", "-p")
+    s.add_argument("text", nargs="+")
+    s.set_defaults(func=cmd_send)
+
+    f = sub.add_parser("file")
+    f.add_argument("--project", "-p")
+    f.add_argument("path")
+    f.add_argument("caption", nargs="*")
+    f.set_defaults(func=cmd_file)
+
+    l = sub.add_parser("last")
+    l.add_argument("--project", "-p")
+    l.set_defaults(func=cmd_last)
+
+    i = sub.add_parser("inbox")
+    i.add_argument("--project", "-p")
+    i.add_argument("--clear", action="store_true")
+    i.set_defaults(func=cmd_inbox)
+
+    sub.add_parser("projects").set_defaults(func=cmd_projects)
+    sub.add_parser("status").set_defaults(func=cmd_status)
+
+    args = ap.parse_args()
+    sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()
